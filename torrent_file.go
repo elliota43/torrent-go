@@ -4,10 +4,11 @@ import (
 	"bytes"
 	"crypto/sha1"
 	"fmt"
-	"github.com/jackpal/bencode-go"
 	"net/url"
 	"os"
 	"strconv"
+
+	"github.com/jackpal/bencode-go"
 )
 
 type TorrentFile struct {
@@ -25,15 +26,14 @@ func (t *TorrentFile) TrackerUrl(peerID [20]byte, port uint16) (string, error) {
 		return "", err
 	}
 
-	params := url.Values{
-		"info_hash":  []string{string(t.InfoHash[:])},
-		"peer_id":    []string{string(peerID[:])},
-		"port":       []string{strconv.Itoa(int(port))},
-		"uploaded":   []string{"0"},
-		"downloaded": []string{"0"},
-		"compact":    []string{"1"},
-		"left":       []string{strconv.Itoa(t.Length)},
-	}
+	params := url.Values{}
+	params.Set("info_hash", string(t.InfoHash[:]))
+	params.Set("peer_id", string(peerID[:]))
+	params.Set("port", strconv.Itoa(int(port)))
+	params.Set("uploaded", "0")
+	params.Set("downloaded", "0")
+	params.Set("compact", "1")
+	params.Set("left", strconv.Itoa(t.Length))
 
 	base.RawQuery = params.Encode()
 	return base.String(), nil

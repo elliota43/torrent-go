@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"net"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -35,12 +36,25 @@ func safelyRequeueWork(work chan *pieceWork, pw *pieceWork) {
 }
 
 func (t *TorrentFile) Download() error {
-	peerID, _ := GeneratePeerID()
-	peers, _ := t.RequestPeers(peerID, 6881)
+	peerID, err := GeneratePeerID()
+	if err != nil {
+		return fmt.Errorf("failed to generate peer ID: %v", err)
+	}
+	peers, err := t.RequestPeers(peerID, 6881)
+	if err != nil {
+		return fmt.Errorf("failed to request peers: %v", err)
+	}
 
 	if len(peers) == 0 {
 		return fmt.Errorf("no peers available")
 	}
+
+	// Open the file once for all piece writes
+	file, err := os.OpenFile(t.Name, os.O_WRONLY|os.O_CREATE, 0666)
+	if err != nil {
+		return fmt.Errorf("failed to open file: %v", err)
+	}
+	defer file.Close()
 
 	// Make workQueue 2x size to allow requeuing failed work without blocking
 	workQueue := make(chan *pieceWork, len(t.PieceHashes)*2)
@@ -48,7 +62,12 @@ func (t *TorrentFile) Download() error {
 
 	// fill work queue
 	for i, hash := range t.PieceHashes {
-		workQueue <- &pieceWork{i, hash, t.PieceLength}
+		pieceLength := t.PieceLength
+		// Last piece might be shorter
+		if i == len(t.PieceHashes)-1 {
+			pieceLength = t.Length - (i * t.PieceLength)
+		}
+		workQueue <- &pieceWork{i, hash, pieceLength}
 	}
 
 	// start workers with WaitGroup tracking
@@ -57,7 +76,7 @@ func (t *TorrentFile) Download() error {
 		wg.Add(1)
 		go func(p Peer) {
 			defer wg.Done()
-			t.startWorker(p, peerID, workQueue, results)
+			t.startWorker(p, peerID, workQueue, results, file)
 		}(peer)
 	}
 
@@ -94,7 +113,7 @@ func (t *TorrentFile) Download() error {
 	return nil
 }
 
-func (t *TorrentFile) startWorker(peer Peer, peerID [20]byte, work chan *pieceWork, results chan *pieceResult) {
+func (t *TorrentFile) startWorker(peer Peer, peerID [20]byte, work chan *pieceWork, results chan *pieceResult, file *os.File) {
 	conn, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", peer.IP, peer.Port), 5*time.Second)
 	if err != nil {
 		return
@@ -103,7 +122,9 @@ func (t *TorrentFile) startWorker(peer Peer, peerID [20]byte, work chan *pieceWo
 
 	// 1. Handshake
 	hs := NewHandshake(t.InfoHash, peerID)
-	conn.Write(hs.Serialize())
+	if _, err := conn.Write(hs.Serialize()); err != nil {
+		return
+	}
 	_, err = ReadHandshake(conn)
 	if err != nil {
 		return
@@ -118,7 +139,13 @@ func (t *TorrentFile) startWorker(peer Peer, peerID [20]byte, work chan *pieceWo
 
 	// 3. Initialize Session State
 	unchoked := false
-	conn.Write((&Message{ID: MsgInterested}).Serialize())
+	interestedMsg := (&Message{ID: MsgInterested}).Serialize()
+	if _, err := conn.Write(interestedMsg); err != nil {
+		return
+	}
+
+	// Set read deadline for unchoke waiting (30 second timeout)
+	unchokeTimeout := 30 * time.Second
 
 	// 4. THE CONSOLIDATED LOOP
 	for pw := range work {
@@ -128,15 +155,26 @@ func (t *TorrentFile) startWorker(peer Peer, peerID [20]byte, work chan *pieceWo
 			continue
 		}
 
-		// Wait for Unchoke (Only need to do this until unchoked is true)
+		// Wait for Unchoke with timeout
 		for !unchoked {
+			conn.SetReadDeadline(time.Now().Add(unchokeTimeout))
 			msg, err := ReadMessage(conn)
 			if err != nil {
 				safelyRequeueWork(work, pw)
 				return
 			}
-			if msg.ID == MsgUnchoke {
+			if msg == nil {
+				continue // Keep-alive message
+			}
+			switch msg.ID {
+			case MsgUnchoke:
 				unchoked = true
+				conn.SetReadDeadline(time.Time{}) // Clear deadline
+			case MsgChoke:
+				unchoked = false // Peer choked us
+			case MsgHave, MsgBitfield, MsgPiece:
+				// Handle other messages but continue waiting for unchoke
+				continue
 			}
 		}
 
@@ -147,7 +185,7 @@ func (t *TorrentFile) startWorker(peer Peer, peerID [20]byte, work chan *pieceWo
 			return // Peer failed us, kill worker
 		}
 
-		if err := t.VerifyAndSave(pw, buf); err != nil {
+		if err := t.VerifyAndSave(pw, buf, file); err != nil {
 			safelyRequeueWork(work, pw)
 			continue
 		}
@@ -170,12 +208,20 @@ func (t *TorrentFile) attemptDownloadPiece(conn net.Conn, pw *pieceWork) ([]byte
 
 		// send request message
 		req := FormatRequest(pw.index, progress.downloaded, blockSize)
-		conn.Write(req.Serialize())
+		if _, err := conn.Write(req.Serialize()); err != nil {
+			return nil, err
+		}
 
 		// Read piece message block
 		msg, err := ReadMessage(conn)
 		if err != nil {
 			return nil, err
+		}
+		if msg == nil {
+			continue // Keep-alive message
+		}
+		if msg.ID == MsgChoke {
+			return nil, fmt.Errorf("peer choked during piece download")
 		}
 		if msg.ID != MsgPiece {
 			continue

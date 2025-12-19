@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/binary"
+	"fmt"
 	"io"
 )
 
@@ -17,6 +18,12 @@ const (
 	MsgRequest
 	MsgPiece
 	MsgCancel
+)
+
+const (
+	// MaxMessageSize is the maximum size of a BitTorrent message (2MB)
+	// This prevents memory exhaustion from malicious peers
+	MaxMessageSize = 2 * 1024 * 1024
 )
 
 type Message struct {
@@ -52,6 +59,11 @@ func ReadMessage(r io.Reader) (*Message, error) {
 	// length 0 means keep-alive
 	if length == 0 {
 		return nil, nil
+	}
+
+	// Validate message size to prevent DoS attacks
+	if length > MaxMessageSize {
+		return nil, fmt.Errorf("message size %d exceeds maximum %d", length, MaxMessageSize)
 	}
 
 	messageBuf := make([]byte, length)

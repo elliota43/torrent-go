@@ -2,9 +2,11 @@ package main
 
 import (
 	"crypto/rand"
-	"github.com/jackpal/bencode-go"
+	"fmt"
 	"net/http"
 	"time"
+
+	"github.com/jackpal/bencode-go"
 )
 
 type bencodeTrackerResponse struct {
@@ -25,6 +27,11 @@ func (t *TorrentFile) RequestPeers(peerID [20]byte, port uint16) ([]Peer, error)
 	}
 
 	defer resp.Body.Close()
+
+	// Check HTTP status code
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("tracker returned status code %d: %s", resp.StatusCode, resp.Status)
+	}
 
 	trackerResp := bencodeTrackerResponse{}
 	err = bencode.Unmarshal(resp.Body, &trackerResp)

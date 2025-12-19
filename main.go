@@ -4,7 +4,7 @@ import "fmt"
 
 func main() {
 	// 1. Load torrent
-	bt, err := Open("ubuntu.torrent")
+	bt, err := Open("nuremberg.torrent")
 	if err != nil {
 		panic(err)
 	}
